@@ -3,6 +3,7 @@
 #include "sonar.h"
 #include "PDcontroller.h" //Uncomment after importing your PDcontroller files
 #include "odometry.h"     //needed for controlled turn for wall following
+#include <Pololu3piPlus32U4Buzzer.h>
 
 using namespace Pololu3piPlus32U4;
 
@@ -50,6 +51,8 @@ Odometry odometry(diaL, diaR, w, nL, nR, gearRatio, DEAD_RECKONING);
 PDcontroller pd_line(kp_line, kd_line, minOutput, maxOutput);
 // PdController for obstacle avoidance
 PDcontroller pd_obs(kp_obs, kd_obs, minOutput, maxOutput);
+// PoluluBuzzer for beep when done
+PololuBuzzer buzzer;
 
 //Recommended Variables
 
@@ -91,7 +94,13 @@ int prevCol = 0;
 int currentMove = 0;
 char visitedCells[ROWS][COLS];
 char movementLog[MAXMOVES];
-int returnIndex;
+int returnIndex = -1;  //initialize with -1 so we know return to dock hasnt started yet
+
+bool justTurned = false; 
+unsigned long moveForwardStart = 0;
+
+// total timekeeping 
+unsigned long startTime, endTime;
 
 //initialize the array with 'N'
 void initializeArray()
@@ -115,19 +124,19 @@ void calibrateSensors()
     if(i < 20 || i >= 60)
       // rotate left over line for 20 interations
       motors.setSpeeds(-calibrationSpeed, calibrationSpeed);
-    else
+     else
       // rotate right over the line for 20 iterations
       motors.setSpeeds(calibrationSpeed, -calibrationSpeed);
     //calibrate with sensors on
     lineSensors.calibrate();
     delay(20);
-    }
-
+  }
   // stop robot when calibration is complete
   motors.setSpeeds(0,0);
 }
 
 void setup() {
+  startTime = millis();
   Serial.begin(9600);
   servo.attach(5);
   servo.write(180); // turn servo left for wall following
@@ -229,7 +238,7 @@ void loop(){
     // if allvistied is true, advance to return to dock
     if (allVisited) {
       task = RETURN_TO_DOCK;
-    } 
+    }
 
   /* //THIS WILL COME IN LATER 
   // start line following
@@ -250,48 +259,69 @@ void loop(){
 
 ///*
   //} else if (task == STOP_AND_PREP) {
-  else if (task == STOP_AND_PREP) {
-    Serial.println("State: Stop and Prep");
-    // stop robot
-    motors.setSpeeds(0, 0);
-    // record starting theta to turn from 
-    theta_start = theta;  
-    task = TURNING;       // TURN goal_theta degrees
+    else if (task == STOP_AND_PREP) {   // fix where this is/ Did it end up instide wall follow? Fix nesting
+      Serial.println("State: Stop and Prep");
+      // stop robot
+      motors.setSpeeds(0, 0);
+      // record starting theta to turn from 
+      theta_start = theta;  
+      task = TURNING;
+      
 //*/
-///*
+/*
+    Once we implement bin pickup, remember to 
+    Serial.print( bin#i pick-confirmed)
+*/
 
-  } else if (task == TURNING) {
-    Serial.println("State: Turning");
+///*
+  // TURN goal_theta degrees
+    } else if (task == TURNING) {
+      Serial.println("State: Turning");
 
     // update encoder counts and odometry
-    deltaL = encoders.getCountsAndResetLeft();
-    deltaR = encoders.getCountsAndResetRight();
-    encCountsLeft += deltaL;
-    encCountsRight += deltaR;
-    odometry.update_odom(encCountsLeft, encCountsRight, x, y, theta);
+      deltaL = encoders.getCountsAndResetLeft();
+      deltaR = encoders.getCountsAndResetRight();
+      encCountsLeft += deltaL;
+      encCountsRight += deltaR;
+      odometry.update_odom(encCountsLeft, encCountsRight, x, y, theta);
 
-    // calculate angle turned calculating normalized angle 
-    float angleTurned = fabs(normalizeAngle(theta - theta_start));
+      // calculate angle turned calculating normalized angle 
+      float angleTurned = fabs(normalizeAngle(theta - theta_start));
 
-    Serial.print("Angle turned: ");
-    Serial.println(angleTurned);
+      Serial.print("Angle turned: ");
+      Serial.println(angleTurned);
 
-    if (angleTurned < goal_theta) {
-      motors.setSpeeds(-baseSpeed, baseSpeed);  //**** CHANGE THIS IS ROBOT IS TURNING 'LEFT' THE WRONG WAY
+      if (angleTurned < goal_theta) {
+        motors.setSpeeds(-baseSpeed, baseSpeed);  //**** CHANGE THIS IS ROBOT IS TURNING 'LEFT' THE WRONG WAY
     } else {
       motors.setSpeeds(0, 0);
       // slight delay to settle if needed
       //delay(50);
+      justTurned = true; 
       task = WALL_FOLLOWING;
     }
   } else if (task == RETURN_TO_DOCK) {
-
     Serial.println("State: Return to Dock");
 
+    // does return to dock need a delay coming out of the turn?
+    // no since it isnt using wall following? 
+
+    // check if return to dock has already run
     if (returnIndex < 0) {
       returnIndex = currentMove - 1;
       motors.setSpeeds(0, 0);
-      // beep here later
+      return;
+    // if we're back before the first move
+    } else if (returnIndex < 0) {
+      motors.setSpeeds(0, 0);
+      //#TODO turn this into a function //
+      buzzer.play("!L16 V8 fgab");
+      endTime = millis();
+      Serial.println("Docked");
+      Serial.print("Start Time: " );
+      Serial.println(startTime);
+      Serial.print("End Time: ");
+      Serial.println(endTime);
       return;
     }
 
@@ -363,11 +393,20 @@ void wallFollowing()
   // using sonar to calculate distance
   wallDist = sonar.readDist();
 
+  // ignore bad reads 
+  if (wallDist <= 0 || wallDist > 100) return;
+
+  // which will work best? Slight delay or move the sonar forward like we did in line follow? 
     // Check distance for greater than wall follow distance (fine tune) 
-    if (wallDist > 20) {  // once this is turned, set variable
+    if (!justTurned && wallDist > 20) {  // once this is turned, set variable
       goal_theta = PI/2; 
-      task = STOP_AND_PREP; 
+      task = STOP_AND_PREP;
+      justTurned = true;
+      moveForwardStart = millis(); 
       return; 
+    }
+    if (justTurned && millis() -moveForwardStart > 1500){  //once this is good, store the delay in a variable
+      justTurned = false;
     }
 
   // call PD Controller to calculate control signal
@@ -439,6 +478,7 @@ void driveForwardOneCell() {
     encCountsRight += deltaR;
     odometry.update_odom(encCountsLeft, encCountsRight, x, y, theta);
 
+    // calcluate distance 
     float dist = sqrt(pow(x - startX, 2) + pow(y - startY, 2));
 
     if (dist >= CELL_SIZE) {
